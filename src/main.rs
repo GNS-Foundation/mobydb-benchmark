@@ -111,11 +111,10 @@ async fn main() {
     info!("Connecting to PostGIS...");
     let pg = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to PostgreSQL");
+        .connect_lazy(&database_url)
+        .expect("Invalid DATABASE_URL");
 
-    info!("PostGIS connected");
+    info!("PostGIS pool created (lazy — will connect on first query)");
     info!("MobyDB target: {}", mobydb_url);
 
     let state = AppState {
@@ -146,8 +145,21 @@ async fn main() {
 // ── Health ─────────────────────────────────────────────────
 
 async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let pg_ok = sqlx::query("SELECT 1").fetch_one(&state.pg).await.is_ok();
-    let moby_ok = reqwest::get(format!("{}/health", state.mobydb_url))
+    let pg_ok = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").fetch_one(&state.pg),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let moby_ok = client
+        .get(format!("{}/health", state.mobydb_url))
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);

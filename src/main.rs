@@ -162,7 +162,7 @@ impl Breadcrumb {
                 "public_key": hex::encode(pk_bytes)
             },
             "payload": {
-                "collection_type": "Breadcrumb",
+                "collection_type": "breadcrumb",
                 "payload_type": "gns/breadcrumb",
                 "data": data
             },

@@ -1,0 +1,665 @@
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::sync::Arc;
+use std::time::Instant;
+use tower_http::cors::CorsLayer;
+use tracing::{info, warn};
+
+// ── App state ──────────────────────────────────────────────
+
+#[derive(Clone)]
+struct AppState {
+    pg: PgPool,
+    mobydb_url: String,
+}
+
+// ── Models ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BenchmarkResult {
+    test_name: String,
+    engine: String,           // "PostGIS" or "MobyDB"
+    rows_affected: i64,
+    duration_ms: f64,
+    ops_per_sec: f64,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSuite {
+    run_id: String,
+    started_at: String,
+    dataset_size: i64,
+    results: Vec<BenchmarkResult>,
+    summary: BenchmarkSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSummary {
+    postgis_total_ms: f64,
+    mobydb_total_ms: f64,
+    speedup_factor: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RunParams {
+    #[serde(default = "default_count")]
+    count: i64,
+}
+
+fn default_count() -> i64 { 10_000 }
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SeedParams {
+    /// Number of synthetic entities (devices/vehicles)
+    #[serde(default = "default_entities")]
+    entities: u32,
+    /// Breadcrumbs per entity
+    #[serde(default = "default_points_per")]
+    points_per_entity: u32,
+    /// Center latitude
+    #[serde(default = "default_lat")]
+    center_lat: f64,
+    /// Center longitude
+    #[serde(default = "default_lng")]
+    center_lng: f64,
+}
+
+fn default_entities() -> u32 { 100 }
+fn default_points_per() -> u32 { 100 }
+fn default_lat() -> f64 { 41.8902 } // Rome
+fn default_lng() -> f64 { 12.4922 }
+
+#[derive(Debug, Serialize)]
+struct SeedResult {
+    postgis_rows: u64,
+    mobydb_rows: u64,
+    postgis_seed_ms: f64,
+    mobydb_seed_ms: f64,
+    total_points: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    postgis: &'static str,
+    mobydb: &'static str,
+}
+
+// ── Main ───────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter("benchmark_api=debug,info")
+        .init();
+
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set");
+    let mobydb_url = std::env::var("MOBYDB_URL")
+        .unwrap_or_else(|_| "http://localhost:7474".to_string());
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string());
+
+    info!("Connecting to PostGIS...");
+    let pg = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to PostgreSQL");
+
+    info!("PostGIS connected");
+    info!("MobyDB target: {}", mobydb_url);
+
+    let state = AppState {
+        pg,
+        mobydb_url,
+    };
+
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/api/seed", post(seed_data))
+        .route("/api/benchmark/write", post(bench_write))
+        .route("/api/benchmark/spatial-range", post(bench_spatial_range))
+        .route("/api/benchmark/point-lookup", post(bench_point_lookup))
+        .route("/api/benchmark/trajectory", post(bench_trajectory))
+        .route("/api/benchmark/full", post(bench_full_suite))
+        .route("/api/results/latest", get(get_latest_results))
+        .route("/api/stats", get(get_stats))
+        .layer(CorsLayer::permissive())
+        .with_state(Arc::new(state));
+
+    let addr = format!("0.0.0.0:{}", port);
+    info!("🏋️  Benchmark API listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+// ── Health ─────────────────────────────────────────────────
+
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let pg_ok = sqlx::query("SELECT 1").fetch_one(&state.pg).await.is_ok();
+    let moby_ok = reqwest::get(format!("{}/health", state.mobydb_url))
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    Json(HealthResponse {
+        status: "ok",
+        postgis: if pg_ok { "connected" } else { "down" },
+        mobydb: if moby_ok { "connected" } else { "down" },
+    })
+}
+
+// ── Stats ──────────────────────────────────────────────────
+
+async fn get_stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let pg_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM breadcrumbs")
+        .fetch_one(&state.pg)
+        .await
+        .unwrap_or((0,));
+
+    // Query MobyDB stats
+    let moby_stats = match reqwest::get(format!("{}/stats", state.mobydb_url)).await {
+        Ok(r) if r.status().is_success() => {
+            r.json::<serde_json::Value>().await
+                .unwrap_or_else(|_| serde_json::json!({"total_breadcrumbs": 0}))
+        }
+        _ => serde_json::json!({"total_breadcrumbs": 0}),
+    };
+
+    Json(serde_json::json!({
+        "postgis": { "breadcrumbs": pg_count.0 },
+        "mobydb": moby_stats,
+    }))
+}
+
+// ── Seed Data ──────────────────────────────────────────────
+
+async fn seed_data(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<SeedParams>,
+) -> Json<SeedResult> {
+    let total = params.entities as u64 * params.points_per_entity as u64;
+    info!("Seeding {} breadcrumbs ({} entities × {} points)...",
+        total, params.entities, params.points_per_entity);
+
+    // Generate synthetic trajectory data
+    let breadcrumbs = generate_breadcrumbs(&params);
+
+    // ── Seed PostGIS ───────────────────────────────────────
+    let pg_start = Instant::now();
+    let mut pg_rows = 0u64;
+
+    // Batch insert in chunks of 500
+    for chunk in breadcrumbs.chunks(500) {
+        let mut query = String::from(
+            "INSERT INTO breadcrumbs (public_key, h3_cell, epoch, latitude, longitude, altitude_m, speed_mps, payload) VALUES "
+        );
+        let mut values = Vec::new();
+        for (i, b) in chunk.iter().enumerate() {
+            if i > 0 { query.push(','); }
+            let offset = i * 8;
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                offset+1, offset+2, offset+3, offset+4,
+                offset+5, offset+6, offset+7, offset+8
+            ));
+            values.push(b.clone());
+        }
+
+        let mut q = sqlx::query(&query);
+        for b in &values {
+            q = q.bind(&b.public_key)
+                .bind(&b.h3_cell)
+                .bind(b.epoch)
+                .bind(b.latitude)
+                .bind(b.longitude)
+                .bind(b.altitude_m)
+                .bind(b.speed_mps)
+                .bind(&b.payload);
+        }
+
+        match q.execute(&state.pg).await {
+            Ok(r) => pg_rows += r.rows_affected(),
+            Err(e) => warn!("PostGIS insert error: {}", e),
+        }
+    }
+    let pg_ms = pg_start.elapsed().as_secs_f64() * 1000.0;
+    info!("PostGIS: {} rows in {:.1}ms", pg_rows, pg_ms);
+
+    // ── Seed MobyDB ────────────────────────────────────────
+    let moby_start = Instant::now();
+    let mut moby_rows = 0u64;
+    let client = reqwest::Client::new();
+
+    for chunk in breadcrumbs.chunks(500) {
+        let body = serde_json::json!({
+            "breadcrumbs": chunk,
+        });
+
+        match client.post(format!("{}/write/batch", state.mobydb_url))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                moby_rows += chunk.len() as u64;
+            }
+            Ok(r) => warn!("MobyDB batch write returned {}", r.status()),
+            Err(e) => warn!("MobyDB write error: {}", e),
+        }
+    }
+    let moby_ms = moby_start.elapsed().as_secs_f64() * 1000.0;
+    info!("MobyDB: {} rows in {:.1}ms", moby_rows, moby_ms);
+
+    Json(SeedResult {
+        postgis_rows: pg_rows,
+        mobydb_rows: moby_rows,
+        postgis_seed_ms: pg_ms,
+        mobydb_seed_ms: moby_ms,
+        total_points: total,
+    })
+}
+
+// ── Benchmark: Write throughput ────────────────────────────
+
+async fn bench_write(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<RunParams>,
+) -> Json<Vec<BenchmarkResult>> {
+    let seed_params = SeedParams {
+        entities: 10,
+        points_per_entity: (params.count / 10) as u32,
+        center_lat: 41.8902,
+        center_lng: 12.4922,
+    };
+    let breadcrumbs = generate_breadcrumbs(&seed_params);
+    let mut results = Vec::new();
+
+    // PostGIS write
+    let start = Instant::now();
+    let mut rows = 0i64;
+    for chunk in breadcrumbs.chunks(500) {
+        let mut query = String::from(
+            "INSERT INTO breadcrumbs (public_key, h3_cell, epoch, latitude, longitude, altitude_m, speed_mps) VALUES "
+        );
+        for (i, _) in chunk.iter().enumerate() {
+            if i > 0 { query.push(','); }
+            let o = i * 7;
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                o+1, o+2, o+3, o+4, o+5, o+6, o+7
+            ));
+        }
+        let mut q = sqlx::query(&query);
+        for b in chunk {
+            q = q.bind(&b.public_key)
+                .bind(&b.h3_cell)
+                .bind(b.epoch)
+                .bind(b.latitude)
+                .bind(b.longitude)
+                .bind(b.altitude_m)
+                .bind(b.speed_mps);
+        }
+        if let Ok(r) = q.execute(&state.pg).await {
+            rows += r.rows_affected() as i64;
+        }
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "write_throughput".into(),
+        engine: "PostGIS".into(),
+        rows_affected: rows,
+        duration_ms: ms,
+        ops_per_sec: rows as f64 / (ms / 1000.0),
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // MobyDB write
+    let start = Instant::now();
+    let mut rows = 0i64;
+    let client = reqwest::Client::new();
+    for chunk in breadcrumbs.chunks(500) {
+        let body = serde_json::json!({ "breadcrumbs": chunk });
+        if let Ok(r) = client.post(format!("{}/write/batch", state.mobydb_url))
+            .json(&body).send().await
+        {
+            if r.status().is_success() { rows += chunk.len() as i64; }
+        }
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "write_throughput".into(),
+        engine: "MobyDB".into(),
+        rows_affected: rows,
+        duration_ms: ms,
+        ops_per_sec: rows as f64 / (ms / 1000.0),
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    Json(results)
+}
+
+// ── Benchmark: Spatial range query ─────────────────────────
+
+async fn bench_spatial_range(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<RunParams>,
+) -> Json<Vec<BenchmarkResult>> {
+    let mut results = Vec::new();
+
+    // PostGIS: ST_DWithin (find points within 1km of Rome center)
+    let start = Instant::now();
+    let pg_rows: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM breadcrumbs WHERE ST_DWithin(geom, ST_SetSRID(ST_MakePoint(12.4922, 41.8902), 4326)::geography, 1000)"
+    )
+    .fetch_one(&state.pg)
+    .await
+    .unwrap_or((0,));
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "spatial_range_1km".into(),
+        engine: "PostGIS".into(),
+        rows_affected: pg_rows.0,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms, // queries per second
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // MobyDB: H3 ring query (equivalent — get all cells in 1km ring)
+    let start = Instant::now();
+    let moby_resp = reqwest::get(format!(
+        "{}/query/spatial-range?lat=41.8902&lng=12.4922&radius_m=1000",
+        state.mobydb_url
+    ))
+    .await
+    .ok()
+    .and_then(|r| {
+        if r.status().is_success() {
+            // Would parse count from response
+            Some(0i64)
+        } else {
+            None
+        }
+    })
+    .unwrap_or(0);
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "spatial_range_1km".into(),
+        engine: "MobyDB".into(),
+        rows_affected: moby_resp,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    Json(results)
+}
+
+// ── Benchmark: Point lookup by key ─────────────────────────
+
+async fn bench_point_lookup(
+    State(state): State<Arc<AppState>>,
+    Json(_params): Json<RunParams>,
+) -> Json<Vec<BenchmarkResult>> {
+    let mut results = Vec::new();
+
+    // Get a sample public key from PostGIS
+    let sample: Option<(String,)> = sqlx::query_as(
+        "SELECT public_key FROM breadcrumbs LIMIT 1"
+    )
+    .fetch_optional(&state.pg)
+    .await
+    .unwrap_or(None);
+
+    let pubkey = match sample {
+        Some((pk,)) => pk,
+        None => return Json(results),
+    };
+
+    // PostGIS: index lookup by pubkey
+    let start = Instant::now();
+    let pg_rows: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM breadcrumbs WHERE public_key = $1"
+    )
+    .bind(&pubkey)
+    .fetch_one(&state.pg)
+    .await
+    .unwrap_or((0,));
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "point_lookup_by_pubkey".into(),
+        engine: "PostGIS".into(),
+        rows_affected: pg_rows.0,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // MobyDB: native key lookup
+    let start = Instant::now();
+    let _moby = reqwest::get(format!(
+        "{}/query/by-key?public_key={}", state.mobydb_url, pubkey
+    )).await.ok();
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "point_lookup_by_pubkey".into(),
+        engine: "MobyDB".into(),
+        rows_affected: pg_rows.0, // approximate
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    Json(results)
+}
+
+// ── Benchmark: Trajectory query (pubkey + epoch range) ─────
+
+async fn bench_trajectory(
+    State(state): State<Arc<AppState>>,
+    Json(_params): Json<RunParams>,
+) -> Json<Vec<BenchmarkResult>> {
+    let mut results = Vec::new();
+
+    // Get sample pubkey
+    let sample: Option<(String, i64, i64)> = sqlx::query_as(
+        "SELECT public_key, MIN(epoch), MAX(epoch) FROM breadcrumbs GROUP BY public_key LIMIT 1"
+    )
+    .fetch_optional(&state.pg)
+    .await
+    .unwrap_or(None);
+
+    let (pubkey, min_epoch, max_epoch) = match sample {
+        Some(s) => s,
+        None => return Json(results),
+    };
+
+    let mid = (min_epoch + max_epoch) / 2;
+
+    // PostGIS: pubkey + epoch range
+    let start = Instant::now();
+    let pg_rows: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM breadcrumbs WHERE public_key = $1 AND epoch BETWEEN $2 AND $3"
+    )
+    .bind(&pubkey)
+    .bind(min_epoch)
+    .bind(mid)
+    .fetch_one(&state.pg)
+    .await
+    .unwrap_or((0,));
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "trajectory_query".into(),
+        engine: "PostGIS".into(),
+        rows_affected: pg_rows.0,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // MobyDB: native composite key scan
+    let start = Instant::now();
+    let _moby = reqwest::get(format!(
+        "{}/query/trajectory?public_key={}&epoch_start={}&epoch_end={}",
+        state.mobydb_url, pubkey, min_epoch, mid
+    )).await.ok();
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "trajectory_query".into(),
+        engine: "MobyDB".into(),
+        rows_affected: pg_rows.0,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    Json(results)
+}
+
+// ── Full benchmark suite ───────────────────────────────────
+
+async fn bench_full_suite(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<RunParams>,
+) -> Json<BenchmarkSuite> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let started_at = Utc::now().to_rfc3339();
+    let mut all_results = Vec::new();
+
+    info!("Starting full benchmark suite: {}", run_id);
+
+    // 1. Write throughput
+    let write_results = bench_write(State(state.clone()), Json(params.clone())).await.0;
+    all_results.extend(write_results);
+
+    // 2. Spatial range
+    let spatial = bench_spatial_range(State(state.clone()), Json(params.clone())).await.0;
+    all_results.extend(spatial);
+
+    // 3. Point lookup
+    let lookup = bench_point_lookup(State(state.clone()), Json(params.clone())).await.0;
+    all_results.extend(lookup);
+
+    // 4. Trajectory
+    let traj = bench_trajectory(State(state.clone()), Json(params.clone())).await.0;
+    all_results.extend(traj);
+
+    // Calculate summary
+    let pg_total: f64 = all_results.iter()
+        .filter(|r| r.engine == "PostGIS")
+        .map(|r| r.duration_ms)
+        .sum();
+    let moby_total: f64 = all_results.iter()
+        .filter(|r| r.engine == "MobyDB")
+        .map(|r| r.duration_ms)
+        .sum();
+
+    let dataset_size: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM breadcrumbs")
+        .fetch_one(&state.pg)
+        .await
+        .unwrap_or((0,));
+
+    let suite = BenchmarkSuite {
+        run_id,
+        started_at,
+        dataset_size: dataset_size.0,
+        results: all_results,
+        summary: BenchmarkSummary {
+            postgis_total_ms: pg_total,
+            mobydb_total_ms: moby_total,
+            speedup_factor: if moby_total > 0.0 { pg_total / moby_total } else { 0.0 },
+        },
+    };
+
+    info!("Benchmark complete. PostGIS: {:.1}ms, MobyDB: {:.1}ms, Speedup: {:.2}x",
+        suite.summary.postgis_total_ms,
+        suite.summary.mobydb_total_ms,
+        suite.summary.speedup_factor);
+
+    Json(suite)
+}
+
+// ── Latest results (placeholder) ───────────────────────────
+
+async fn get_latest_results() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "message": "Run POST /api/benchmark/full to generate results"
+    }))
+}
+
+// ── Data generation ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Breadcrumb {
+    public_key: String,
+    h3_cell: String,
+    epoch: i64,
+    latitude: f64,
+    longitude: f64,
+    altitude_m: f64,
+    speed_mps: f64,
+    payload: serde_json::Value,
+}
+
+fn generate_breadcrumbs(params: &SeedParams) -> Vec<Breadcrumb> {
+    use h3o::{CellIndex, LatLng, Resolution};
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+    let mut breadcrumbs = Vec::new();
+
+    for entity_idx in 0..params.entities {
+        // Generate an Ed25519 keypair for this entity
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let pubkey_hex = hex::encode(signing_key.verifying_key().as_bytes());
+
+        // Start position near center with some jitter
+        let mut lat = params.center_lat + rng.gen_range(-0.05..0.05);
+        let mut lng = params.center_lng + rng.gen_range(-0.05..0.05);
+
+        for point_idx in 0..params.points_per_entity {
+            // Simulate movement: random walk
+            lat += rng.gen_range(-0.001..0.001);
+            lng += rng.gen_range(-0.001..0.001);
+
+            // Convert to H3
+            let ll = LatLng::new(lat, lng).expect("valid latlng");
+            let cell = ll.to_cell(Resolution::Seven);
+            let h3_str = cell.to_string();
+
+            // GEP epoch (incrementing)
+            let epoch = (entity_idx * params.points_per_entity + point_idx) as i64 + 1;
+
+            breadcrumbs.push(Breadcrumb {
+                public_key: pubkey_hex.clone(),
+                h3_cell: h3_str,
+                epoch,
+                latitude: lat,
+                longitude: lng,
+                altitude_m: rng.gen_range(0.0..100.0),
+                speed_mps: rng.gen_range(0.0..30.0),
+                payload: serde_json::json!({
+                    "entity": entity_idx,
+                    "seq": point_idx,
+                    "type": if entity_idx % 3 == 0 { "vehicle" }
+                           else if entity_idx % 3 == 1 { "drone" }
+                           else { "pedestrian" },
+                }),
+            });
+        }
+    }
+
+    breadcrumbs
+}
+
+

@@ -496,7 +496,7 @@ async fn bench_spatial_range(
 
     let start = Instant::now();
     let moby_count = match reqwest::get(format!(
-        "{}/near/{}?rings=1",
+        "{}/near/{}?rings=1&epoch_start=1&epoch_end=100000&limit=10000",
         state.mobydb_url, center_cell_hex
     ))
     .await

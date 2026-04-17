@@ -550,7 +550,7 @@ async fn bench_point_lookup(
 
     // Get a sample public key + cell + epoch from PostGIS
     let sample: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT public_key, h3_cell, epoch FROM breadcrumbs LIMIT 1",
+        "SELECT public_key, h3_cell, epoch FROM breadcrumbs ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(&state.pg)
     .await
@@ -625,7 +625,7 @@ async fn bench_trajectory(
 
     // Get sample pubkey with epoch range
     let sample: Option<(String, i64, i64)> = sqlx::query_as(
-        "SELECT public_key, MIN(epoch), MAX(epoch) FROM breadcrumbs GROUP BY public_key LIMIT 1",
+        "SELECT public_key, MIN(epoch), MAX(epoch) FROM breadcrumbs WHERE id > (SELECT MAX(id) - 10000 FROM breadcrumbs) GROUP BY public_key LIMIT 1",
     )
     .fetch_optional(&state.pg)
     .await

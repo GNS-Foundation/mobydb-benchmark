@@ -582,9 +582,13 @@ async fn bench_point_lookup(
     // MobyDB: /record/:cell/:epoch/:pubkey — exact record lookup
     // h3_cell from PostGIS is already hex format (e.g. "871e8052affffff")
     let start = Instant::now();
+    // Convert hex h3_cell to u64 — MobyDB address uses u64
+    let h3_u64 = u64::from(
+        h3_cell_str.parse::<h3o::CellIndex>().unwrap()
+    );
     let moby_found = match reqwest::get(format!(
         "{}/record/{}/{}/{}",
-        state.mobydb_url, h3_cell_str, epoch, pubkey
+        state.mobydb_url, h3_u64, epoch, pubkey
     ))
     .await
     {
@@ -674,10 +678,13 @@ async fn bench_trajectory(
 
     let client = reqwest::Client::new();
     for (cell_str, ep) in &cell_epochs {
+        let h3_u64 = u64::from(
+            cell_str.parse::<h3o::CellIndex>().unwrap()
+        );
         if let Ok(r) = client
             .get(format!(
                 "{}/record/{}/{}/{}",
-                state.mobydb_url, cell_str, ep, pubkey
+                state.mobydb_url, h3_u64, ep, pubkey
             ))
             .send()
             .await

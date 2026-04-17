@@ -676,14 +676,14 @@ async fn bench_trajectory(
     .unwrap_or_default();
 
     let client = reqwest::Client::new();
-    let futures: Vec<_> = cell_epochs.iter().map(|(cell_str, ep)| {
+    let futs: Vec<_> = cell_epochs.iter().map(|(cell_str, ep)| {
         let h3_u64 = u64::from(cell_str.parse::<h3o::CellIndex>().unwrap());
         let url = format!("{}/record/{}/{}/{}", state.mobydb_url, h3_u64, ep, pubkey);
         let c = client.clone();
         async move { c.get(&url).send().await }
     }).collect();
 
-    let responses = futures::future::join_all(futures).await;
+    let responses = futures::future::join_all(futs).await;
     let moby_count = responses.iter()
         .filter(|r| r.as_ref().map(|r| r.status().is_success()).unwrap_or(false))
         .count() as i64;

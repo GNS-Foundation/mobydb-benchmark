@@ -583,9 +583,14 @@ async fn bench_point_lookup(
     // h3_cell from PostGIS is already hex format (e.g. "871e8052affffff")
     let start = Instant::now();
     // Convert hex h3_cell to u64 — MobyDB address uses u64
-    let h3_u64 = u64::from(
-        h3_cell_str.parse::<h3o::CellIndex>().unwrap()
-    );
+    let h3_cell = match h3_cell_str.parse::<h3o::CellIndex>() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("point_lookup: failed to parse h3_cell '{}': {}", h3_cell_str, e);
+            return Json(results);
+        }
+    };
+    let h3_u64 = u64::from(h3_cell);
     let moby_found = match reqwest::get(format!(
         "{}/record/{}/{}/{}",
         state.mobydb_url, h3_u64, epoch, pubkey
@@ -676,11 +681,14 @@ async fn bench_trajectory(
     .unwrap_or_default();
 
     let client = reqwest::Client::new();
-    let futs: Vec<_> = cell_epochs.iter().map(|(cell_str, ep)| {
-        let h3_u64 = u64::from(cell_str.parse::<h3o::CellIndex>().unwrap());
+    let futs: Vec<_> = cell_epochs.iter().filter_map(|(cell_str, ep)| {
+        let h3_u64 = match cell_str.parse::<h3o::CellIndex>() {
+            Ok(c) => u64::from(c),
+            Err(_) => return None,
+        };
         let url = format!("{}/record/{}/{}/{}", state.mobydb_url, h3_u64, ep, pubkey);
         let c = client.clone();
-        async move { c.get(&url).send().await }
+        Some(async move { c.get(&url).send().await })
     }).collect();
 
     let responses = futures::future::join_all(futs).await;

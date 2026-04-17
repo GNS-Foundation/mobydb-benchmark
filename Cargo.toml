@@ -28,3 +28,4 @@ tower-http = { version = "0.5", features = ["cors"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 blake3 = "1"
+futures = "0.3"

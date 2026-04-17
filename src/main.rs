@@ -663,7 +663,6 @@ async fn bench_trajectory(
     // MobyDB's native key is (cell, epoch, pubkey) — we look up multiple epochs
     // For a fair comparison, we query each epoch point individually
     let start = Instant::now();
-    let mut moby_count = 0i64;
 
     // Get the h3_cells for this pubkey from PostGIS to know which cells to query in MobyDB
     let cell_epochs: Vec<(String, i64)> = sqlx::query_as(
@@ -677,23 +676,17 @@ async fn bench_trajectory(
     .unwrap_or_default();
 
     let client = reqwest::Client::new();
-    for (cell_str, ep) in &cell_epochs {
-        let h3_u64 = u64::from(
-            cell_str.parse::<h3o::CellIndex>().unwrap()
-        );
-        if let Ok(r) = client
-            .get(format!(
-                "{}/record/{}/{}/{}",
-                state.mobydb_url, h3_u64, ep, pubkey
-            ))
-            .send()
-            .await
-        {
-            if r.status().is_success() {
-                moby_count += 1;
-            }
-        }
-    }
+    let futures: Vec<_> = cell_epochs.iter().map(|(cell_str, ep)| {
+        let h3_u64 = u64::from(cell_str.parse::<h3o::CellIndex>().unwrap());
+        let url = format!("{}/record/{}/{}/{}", state.mobydb_url, h3_u64, ep, pubkey);
+        let c = client.clone();
+        async move { c.get(&url).send().await }
+    }).collect();
+
+    let responses = futures::future::join_all(futures).await;
+    let moby_count = responses.iter()
+        .filter(|r| r.as_ref().map(|r| r.status().is_success()).unwrap_or(false))
+        .count() as i64;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
         test_name: "trajectory_query".into(),

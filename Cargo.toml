@@ -32,7 +32,7 @@ futures = "0.3"
 tempfile = "3"
 
 # MobyDB in-process (the fair benchmark)
-mobydb-core    = { path = "../mobydb/crates/mobydb-core" }
-mobydb-storage = { path = "../mobydb/crates/mobydb-storage" }
-mobydb-query   = { path = "../mobydb/crates/mobydb-query" }
-mobydb-merkle  = { path = "../mobydb/crates/mobydb-merkle" }
+mobydb-core    = { path = "crates/mobydb-core" }
+mobydb-storage = { path = "crates/mobydb-storage" }
+mobydb-query   = { path = "crates/mobydb-query" }
+mobydb-merkle  = { path = "crates/mobydb-merkle" }

@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Cache dependencies
+# Cache dependencies — copy crates first since Cargo.toml references them
 COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
 RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'fn main() {}' > src/seed.rs && \

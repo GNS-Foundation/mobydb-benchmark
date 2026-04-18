@@ -550,7 +550,7 @@ async fn bench_point_lookup(
 
     // Get a sample public key + cell + epoch from PostGIS
     let sample: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT public_key, h3_cell, epoch FROM breadcrumbs ORDER BY id DESC LIMIT 1",
+        "SELECT public_key, h3_cell, epoch::bigint FROM breadcrumbs LIMIT 1",
     )
     .fetch_optional(&state.pg)
     .await
@@ -626,7 +626,7 @@ async fn bench_trajectory(
 
     // Get 20 recent records to use as individual MobyDB lookups
     let sample_records: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT public_key, h3_cell, epoch::bigint FROM breadcrumbs WHERE id > (SELECT MAX(id) - 10000 FROM breadcrumbs) LIMIT 20",
+        "SELECT public_key, h3_cell, epoch::bigint FROM breadcrumbs LIMIT 20",
     )
     .fetch_all(&state.pg)
     .await

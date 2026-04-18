@@ -616,7 +616,7 @@ async fn bench_point_lookup(
     Json(results)
 }
 
-// ── Benchmark: Trajectory query (pubkey + epoch range) ─────
+// ── Benchmark: Parallel multi-record lookup ────────────────
 
 async fn bench_trajectory(
     State(state): State<Arc<AppState>>,
@@ -624,64 +624,51 @@ async fn bench_trajectory(
 ) -> Json<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
 
-    // Get sample pubkey with epoch range
-    let sample: Option<(String, i64, i64)> = sqlx::query_as(
-        "SELECT public_key, MIN(epoch), MAX(epoch) FROM breadcrumbs WHERE id > (SELECT MAX(id) - 10000 FROM breadcrumbs) GROUP BY public_key LIMIT 1",
+    // Get 20 recent records to use as individual MobyDB lookups
+    let sample_records: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT public_key, h3_cell, epoch FROM breadcrumbs WHERE id > (SELECT MAX(id) - 10000 FROM breadcrumbs) LIMIT 20",
     )
-    .fetch_optional(&state.pg)
+    .fetch_all(&state.pg)
     .await
-    .unwrap_or(None);
+    .unwrap_or_default();
 
-    let (pubkey, min_epoch, max_epoch) = match sample {
-        Some(s) => s,
-        None => return Json(results),
-    };
+    if sample_records.is_empty() {
+        return Json(results);
+    }
 
-    let mid = (min_epoch + max_epoch) / 2;
-
-    // PostGIS: pubkey + epoch range
+    // PostGIS: individual point lookups by (pubkey, h3_cell, epoch)
     let start = Instant::now();
-    let pg_rows: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM breadcrumbs WHERE public_key = $1 AND epoch BETWEEN $2 AND $3",
-    )
-    .bind(&pubkey)
-    .bind(min_epoch)
-    .bind(mid)
-    .fetch_one(&state.pg)
-    .await
-    .unwrap_or((0,));
+    let mut pg_found = 0i64;
+    for (pubkey, h3_cell, epoch) in &sample_records {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM breadcrumbs WHERE public_key = $1 AND h3_cell = $2 AND epoch = $3",
+        )
+        .bind(pubkey)
+        .bind(h3_cell)
+        .bind(epoch)
+        .fetch_one(&state.pg)
+        .await
+        .unwrap_or((0,));
+        pg_found += row.0;
+    }
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
-        test_name: "trajectory_query".into(),
+        test_name: "parallel_lookup_20".into(),
         engine: "PostGIS".into(),
-        rows_affected: pg_rows.0,
+        rows_affected: pg_found,
         duration_ms: ms,
         ops_per_sec: 1000.0 / ms,
         timestamp: Utc::now().to_rfc3339(),
     });
 
-    // MobyDB: fetch individual records across epochs
-    // MobyDB's native key is (cell, epoch, pubkey) — we look up multiple epochs
-    // For a fair comparison, we query each epoch point individually
+    // MobyDB: parallel point lookups by (cell, epoch, pubkey)
     let start = Instant::now();
-
-    // Get the h3_cells for this pubkey from PostGIS to know which cells to query in MobyDB
-    let cell_epochs: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT h3_cell, epoch FROM breadcrumbs WHERE public_key = $1 AND epoch BETWEEN $2 AND $3",
-    )
-    .bind(&pubkey)
-    .bind(min_epoch)
-    .bind(mid)
-    .fetch_all(&state.pg)
-    .await
-    .unwrap_or_default();
-
     let client = reqwest::Client::new();
-    let futs: Vec<_> = cell_epochs.iter().filter_map(|(cell_str, ep)| {
+    let futs: Vec<_> = sample_records.iter().filter_map(|(pubkey, cell_str, epoch)| {
         if cell_str.parse::<h3o::CellIndex>().is_err() {
             return None;
         }
-        let url = format!("{}/record/{}/{}/{}", state.mobydb_url, cell_str, ep, pubkey);
+        let url = format!("{}/record/{}/{}/{}", state.mobydb_url, cell_str, epoch, pubkey);
         let c = client.clone();
         Some(async move { c.get(&url).send().await })
     }).collect();
@@ -692,7 +679,7 @@ async fn bench_trajectory(
         .count() as i64;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     results.push(BenchmarkResult {
-        test_name: "trajectory_query".into(),
+        test_name: "parallel_lookup_20".into(),
         engine: "MobyDB".into(),
         rows_affected: moby_count,
         duration_ms: ms,

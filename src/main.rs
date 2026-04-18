@@ -13,6 +13,11 @@ use std::time::Instant;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
+// MobyDB in-process
+use mobydb_core::{CollectionType, MobyPayload, MobyRecord, SpacetimeAddress, TrustTier};
+use mobydb_query::MobyQuery;
+use mobydb_storage::MobyStore;
+
 // ── App state ──────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -205,6 +210,7 @@ async fn main() {
         .route("/api/benchmark/point-lookup", post(bench_point_lookup))
         .route("/api/benchmark/trajectory", post(bench_trajectory))
         .route("/api/benchmark/full", post(bench_full_suite))
+        .route("/api/benchmark/embedded", post(bench_embedded))
         .route("/api/results/latest", get(get_latest_results))
         .route("/api/stats", get(get_stats))
         .layer(CorsLayer::permissive())
@@ -783,6 +789,191 @@ async fn get_latest_results() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "message": "Run POST /api/benchmark/full to generate results"
     }))
+}
+
+// ── Benchmark: Embedded MobyDB (in-process) ───────────────
+
+async fn bench_embedded(
+    State(_state): State<Arc<AppState>>,
+    Json(params): Json<RunParams>,
+) -> Json<Vec<BenchmarkResult>> {
+    // Run the embedded benchmark on a blocking thread (RocksDB is sync)
+    let results = tokio::task::spawn_blocking(move || {
+        run_embedded_benchmark(params.count)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!("embedded benchmark task panicked: {}", e);
+        vec![]
+    });
+
+    Json(results)
+}
+
+fn run_embedded_benchmark(count: i64) -> Vec<BenchmarkResult> {
+    use rand::Rng;
+
+    let mut results = Vec::new();
+    let total = count as u32;
+
+    // Open a MobyStore in a temp directory
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let store = MobyStore::open(tmp_dir.path()).expect("failed to open MobyStore");
+
+    info!("Embedded benchmark: {} records into {:?}", total, tmp_dir.path());
+
+    // Generate MobyRecords directly (same shape as generate_breadcrumbs)
+    let mut rng = rand::thread_rng();
+    let entities = 10u32;
+    let points_per = total / entities;
+    let center_lat = 41.8902f64;
+    let center_lng = 12.4922f64;
+
+    let mut records: Vec<MobyRecord> = Vec::with_capacity(total as usize);
+    // Keep one address for the point-lookup benchmark later
+    let mut sample_address: Option<SpacetimeAddress> = None;
+    // Keep the center cell for near query
+    let mut center_cell_u64: u64 = 0;
+
+    for entity_idx in 0..entities {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let pk_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let mut lat = center_lat + rng.gen_range(-0.05..0.05);
+        let mut lng = center_lng + rng.gen_range(-0.05..0.05);
+
+        for point_idx in 0..points_per {
+            lat += rng.gen_range(-0.001..0.001);
+            lng += rng.gen_range(-0.001..0.001);
+
+            let ll = h3o::LatLng::new(lat, lng).expect("valid latlng");
+            let cell = ll.to_cell(h3o::Resolution::Seven);
+            let h3_u64 = u64::from(cell);
+            let epoch = (entity_idx * points_per + point_idx) as u64 + 1;
+
+            if entity_idx == 0 && point_idx == 0 {
+                center_cell_u64 = h3_u64;
+            }
+
+            let address = SpacetimeAddress::new(h3_u64, epoch, pk_bytes);
+
+            let data = serde_json::json!({
+                "lat": lat,
+                "lng": lng,
+                "altitude_m": rng.gen_range(0.0..100.0f64),
+                "speed_mps": rng.gen_range(0.0..30.0f64),
+                "h3_cell_hex": cell.to_string(),
+            });
+
+            let payload = MobyPayload {
+                collection_type: CollectionType::Breadcrumb,
+                payload_type: "gns/breadcrumb".to_string(),
+                data,
+            };
+
+            let written_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            // Build canonical bytes and sign
+            let mut canon = serde_json::Map::new();
+            canon.insert("data".into(), payload.data.clone());
+            canon.insert("epoch".into(), serde_json::json!(epoch));
+            canon.insert("h3_cell".into(), serde_json::json!(h3_u64));
+            canon.insert("payload_type".into(), serde_json::json!("gns/breadcrumb"));
+            canon.insert("public_key".into(), serde_json::json!(hex::encode(pk_bytes)));
+            canon.insert("written_at_ms".into(), serde_json::json!(written_at_ms));
+            let canon_bytes = serde_json::to_vec(&serde_json::Value::Object(canon)).unwrap_or_default();
+
+            use ed25519_dalek::Signer;
+            let sig = signing_key.sign(&canon_bytes);
+
+            let record = MobyRecord {
+                address: address.clone(),
+                payload,
+                signature: sig.to_bytes(),
+                trust_tier: TrustTier::Navigator,
+                written_at_ms,
+            };
+
+            if sample_address.is_none() {
+                sample_address = Some(address);
+            }
+
+            records.push(record);
+        }
+    }
+
+    // ── 1. Write benchmark ─────────────────────────────────
+    let start = Instant::now();
+    let batch_size = 500;
+    let mut written = 0i64;
+    for chunk in records.chunks(batch_size) {
+        match store.write_batch(chunk) {
+            Ok(keys) => written += keys.len() as i64,
+            Err(e) => warn!("embedded write_batch error: {}", e),
+        }
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "write_throughput".into(),
+        engine: "MobyDB-Embedded".into(),
+        rows_affected: written,
+        duration_ms: ms,
+        ops_per_sec: written as f64 / (ms / 1000.0),
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // ── 2. Near query (2 rings) ────────────────────────────
+    let start = Instant::now();
+    let near_result = MobyQuery::near(center_cell_u64, 2)
+        .during(1, total as u64)
+        .limit(10_000)
+        .execute(&store);
+    let near_count = match &near_result {
+        Ok(qr) => qr.count as i64,
+        Err(e) => {
+            warn!("embedded near query error: {}", e);
+            0
+        }
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "spatial_range_2rings".into(),
+        engine: "MobyDB-Embedded".into(),
+        rows_affected: near_count,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    // ── 3. Point lookup (read by address) ──────────────────
+    let start = Instant::now();
+    let lookup_found = if let Some(addr) = &sample_address {
+        match store.read(addr) {
+            Ok(_) => 1i64,
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    results.push(BenchmarkResult {
+        test_name: "point_lookup".into(),
+        engine: "MobyDB-Embedded".into(),
+        rows_affected: lookup_found,
+        duration_ms: ms,
+        ops_per_sec: 1000.0 / ms,
+        timestamp: Utc::now().to_rfc3339(),
+    });
+
+    info!(
+        "Embedded benchmark done: {} written, {} near, {} lookup",
+        written, near_count, lookup_found
+    );
+
+    results
 }
 
 // ── Data generation ────────────────────────────────────────

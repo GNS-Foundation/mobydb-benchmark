@@ -29,3 +29,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 blake3 = "1"
 futures = "0.3"
+tempfile = "3"
+
+# MobyDB in-process (the fair benchmark)
+mobydb-core    = { path = "../mobydb/crates/mobydb-core" }
+mobydb-storage = { path = "../mobydb/crates/mobydb-storage" }
+mobydb-query   = { path = "../mobydb/crates/mobydb-query" }
+mobydb-merkle  = { path = "../mobydb/crates/mobydb-merkle" }

@@ -37,3 +37,4 @@ COPY --from=builder /app/target/release/benchmark-api /usr/local/bin/benchmark-a
 EXPOSE 3000
 
 CMD ["benchmark-api"]
+

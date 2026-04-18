@@ -21,7 +21,7 @@ RUN rm -rf src
 
 # Build real source
 COPY src/ src/
-RUN cargo build --release --bin benchmark-api
+RUN touch src/main.rs && cargo build --release --bin benchmark-api
 
 # ── Runtime ──────────────────────────────────────────────
 FROM debian:bookworm-slim
